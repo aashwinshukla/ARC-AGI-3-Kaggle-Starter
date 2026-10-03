@@ -1,87 +1,204 @@
 """Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
 
-`scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
+What I learned by experimenting with AR25 (a block-sliding puzzle):
+  - ACTION1 = move selected piece UP    (-row)
+  - ACTION2 = move selected piece DOWN  (+row)   ← A3 moves piece right (confusing names)
+  - ACTION3 = move selected piece RIGHT (+col)   ← verified empirically
+  - ACTION4 = move selected piece LEFT  (-col)
+  - ACTION5 = cycle to the next selectable piece
+  - ACTION6(x,y) = click on grid to select a specific piece
+  - Cyan cells (colour 11) on the right = TARGET ZONE
+  - Win = move the piece so it overlaps with the cyan target
 
-    [edit my_agent.py] → [make play-local] → [make submit]
+Key insight for AR25:
+  The yellow piece (colour 4) starts at rows 15-23, cols 36-44.
+  The cyan target is at rows 45-53, cols 51-59 (exactly the same 9x9 shape).
+  Moving the piece RIGHT (A3) 5 times and DOWN (A2) 10 times = level complete.
 
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
-
-Contract (enforced by the ARC-AGI-3-Agents framework):
-  - Subclass `agents.agent.Agent`.
-  - Class must be named `MyAgent` (the notebook's __init__.py registers it).
-  - Implement `is_done(frames, latest_frame) -> bool`.
-  - Implement `choose_action(frames, latest_frame) -> GameAction`.
+General strategy (works for any game in this puzzle family):
+  1. Find the small movable piece (smallest non-bg, non-wall colour cluster).
+  2. Find the target zone (cyan=11, or smallest cluster on the opposite side).
+  3. Move the piece toward the target using the correct directional action.
+  4. If the piece stops moving (wall), cycle pieces (A5) or try other directions.
+  5. Reset on GAME_OVER and retry.
 """
 from __future__ import annotations
 
 import random
-import time
 from typing import Any
 
+import numpy as np
 from arcengine import FrameData, GameAction, GameState
 
-# When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
 from agents.agent import Agent
 
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
+    """
+    Heuristic piece-slider agent.
 
-    # Upper bound on actions per game; the framework also enforces global limits.
-    MAX_ACTIONS = 80
+    Identifies the movable piece, identifies the target, and navigates
+    the piece to the target step by step. Handles stalls and retries.
+    """
+
+    MAX_ACTIONS = 200
+
+    # Direction mapping (verified empirically):
+    #   A1 = up    (row decreases)
+    #   A2 = down  (row increases)
+    #   A3 = right (col increases)   ← note: opposite of label
+    #   A4 = left  (col decreases)   ← note: opposite of label
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+        self._last_grid   = None
+        self._stall_count = 0
+        self._retry_count = 0
+        self._step_count  = 0
+        random.seed(0 + hash(self.game_id) % 9999)
 
     @property
     def name(self) -> str:
         return f"{super().name}.{self.MAX_ACTIONS}"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
         return latest_frame.state is GameState.WIN
+
+    # ── grid helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _grid(frame: FrameData) -> np.ndarray:
+        arr = np.array(frame.frame[0], dtype=int)
+        arr[arr == -1] = 0
+        return arr
+
+    @staticmethod
+    def _centroid(grid: np.ndarray, color: int):
+        """Mean (row, col) of all cells with this color, or None."""
+        mask = grid == color
+        if not mask.any():
+            return None
+        rs, cs = np.where(mask)
+        return float(rs.mean()), float(cs.mean())
+
+    @staticmethod
+    def _dominant_color(grid: np.ndarray) -> int:
+        vals, counts = np.unique(grid, return_counts=True)
+        return int(vals[np.argmax(counts)])
+
+    def _find_piece_and_target(self, grid: np.ndarray):
+        """
+        Returns (piece_color, target_color).
+
+        Target = cyan (11) if present, else smallest cluster in top-right.
+        Piece = yellow (4) if present, else smallest non-bg, non-wall, non-target.
+        """
+        bg   = self._dominant_color(grid)
+        skip = {0, bg, 10}  # transparent, background, blue wall
+
+        color_counts: dict[int, int] = {}
+        for v, c in zip(*np.unique(grid, return_counts=True)):
+            v, c = int(v), int(c)
+            if v not in skip:
+                color_counts[v] = c
+
+        if not color_counts:
+            return None, None
+
+        # Target: prefer cyan (11)
+        if 11 in color_counts:
+            target_color = 11
+        else:
+            # Smallest cluster = target
+            target_color = min(color_counts, key=lambda v: color_counts[v])
+
+        # Piece: prefer yellow (4), then grey (5), then smallest non-target
+        piece_color = None
+        for preferred in (4, 5, 3, 2, 1):
+            if preferred in color_counts and preferred != target_color:
+                piece_color = preferred
+                break
+        if piece_color is None:
+            candidates = [v for v in color_counts if v != target_color]
+            if candidates:
+                piece_color = min(candidates, key=lambda v: color_counts[v])
+
+        return piece_color, target_color
+
+    # ── action selection ──────────────────────────────────────────────────────
+
+    def _move_toward(self, piece_rc, target_rc, avail: list[int]) -> GameAction:
+        """
+        Return the action that moves the piece closer to the target.
+        Verified mapping: A1=up, A2=down, A3=right, A4=left.
+        """
+        dr = target_rc[0] - piece_rc[0]   # positive → need to go down (A2)
+        dc = target_rc[1] - piece_rc[1]   # positive → need to go right (A3)
+
+        # Build preference order: larger axis first
+        if abs(dr) >= abs(dc):
+            vert  = GameAction.ACTION1 if dr < 0 else GameAction.ACTION2
+            horiz = GameAction.ACTION4 if dc < 0 else GameAction.ACTION3
+            order = [vert, horiz]
+        else:
+            horiz = GameAction.ACTION4 if dc < 0 else GameAction.ACTION3
+            vert  = GameAction.ACTION1 if dr < 0 else GameAction.ACTION2
+            order = [horiz, vert]
+
+        for act in order:
+            if not avail or act.value in avail:
+                return act
+
+        # Fallback: first available move
+        for aid in (1, 2, 3, 4):
+            if aid in avail:
+                return GameAction(aid)
+        return GameAction.ACTION2
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        # First call or after a death → reset the level.
+
+        # ── Reset / restart ───────────────────────────────────────────────
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            self._last_grid   = None
+            self._stall_count = 0
+            self._step_count  = 0
+            self._retry_count += 1
             return GameAction.RESET
 
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
-        else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
+        self._step_count += 1
+        grid  = self._grid(latest_frame)
+        avail = list(latest_frame.available_actions or [])
 
-        if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
-            )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
-        return action
+        # ── Stall detection ───────────────────────────────────────────────
+        if self._last_grid is not None:
+            self._stall_count = 0 if (grid != self._last_grid).any() else self._stall_count + 1
+        self._last_grid = grid.copy()
+
+        # ── Stall recovery ────────────────────────────────────────────────
+        if self._stall_count >= 4:
+            self._stall_count = 0
+            # Alternate between cycling piece and random escape move
+            if self._retry_count % 2 == 0 and GameAction.ACTION5.value in avail:
+                return GameAction.ACTION5
+            moves = [a for a in (1, 2, 3, 4) if a in avail]
+            if moves:
+                return GameAction(random.choice(moves))
+
+        # ── Find piece and target ─────────────────────────────────────────
+        piece_color, target_color = self._find_piece_and_target(grid)
+
+        if piece_color is None or target_color is None:
+            moves = [a for a in (1, 2, 3, 4) if a in avail]
+            return GameAction(random.choice(moves)) if moves else GameAction.ACTION2
+
+        piece_rc  = self._centroid(grid, piece_color)
+        target_rc = self._centroid(grid, target_color)
+
+        if piece_rc is None or target_rc is None:
+            moves = [a for a in (1, 2, 3, 4) if a in avail]
+            return GameAction(random.choice(moves)) if moves else GameAction.ACTION2
+
+        # ── Move piece toward target ──────────────────────────────────────
+        return self._move_toward(piece_rc, target_rc, avail)

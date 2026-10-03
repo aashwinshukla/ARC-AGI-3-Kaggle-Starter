@@ -12,6 +12,10 @@ environment_files/
 recordings/
 logs.log
 
+# Duplicate framework clone and offline wheel cache (not needed in repo)
+ARC-AGI-3-Agents/
+arc_agi_3_wheels/
+
 # Generated artefacts
 notebooks/submission.ipynb
 reference/

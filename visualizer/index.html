@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ARC-AGI-3 Visualizer</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0f0f13;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      gap: 16px;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      color: #a0c4ff;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Top bar ──────────────────────────────────────────── */
+    #topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    select, button {
+      background: #1e1e2e;
+      color: #e0e0e0;
+      border: 1px solid #3a3a5c;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    select:hover, button:hover { background: #2a2a40; }
+    button#btnStart  { background: #2563eb; border-color: #3b82f6; }
+    button#btnStart:hover { background: #1d4ed8; }
+    button#btnReset  { background: #7c3aed; border-color: #8b5cf6; }
+    button#btnReset:hover { background: #6d28d9; }
+
+    /* ── Status bar ───────────────────────────────────────── */
+    #status {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      min-height: 1.2em;
+      text-align: center;
+    }
+    #status.win  { color: #4ade80; font-weight: bold; }
+    #status.over { color: #f87171; }
+
+    /* ── Main layout ──────────────────────────────────────── */
+    #main {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    /* ── Canvas wrapper ───────────────────────────────────── */
+    #canvasWrap {
+      position: relative;
+      cursor: crosshair;
+    }
+    canvas {
+      display: block;
+      image-rendering: pixelated;   /* keeps pixels sharp when scaled */
+      border: 2px solid #3a3a5c;
+      border-radius: 4px;
+    }
+    /* click-target overlay — invisible, same size as canvas */
+    #clickOverlay {
+      position: absolute;
+      inset: 0;
+    }
+
+    /* ── Right panel ──────────────────────────────────────── */
+    #panel {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 200px;
+      max-width: 240px;
+    }
+
+    .card {
+      background: #1e1e2e;
+      border: 1px solid #3a3a5c;
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .card h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin-bottom: 8px;
+    }
+
+    /* Stats */
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+    .stat-val { color: #a0c4ff; font-weight: 600; }
+
+    /* Actions */
+    #actionGrid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    .action-btn {
+      padding: 8px 4px;
+      text-align: center;
+      border-radius: 5px;
+      border: 1px solid #3a3a5c;
+      background: #14142a;
+      color: #c0c0e0;
+      font-size: 0.82rem;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.1s;
+    }
+    .action-btn:hover  { background: #2a2a50; }
+    .action-btn.active { background: #2563eb; border-color: #60a5fa; color: #fff; }
+    .action-btn.disabled { opacity: 0.35; cursor: default; }
+
+    /* Key legend */
+    #keyLegend {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+    }
+    .key-row { display: flex; gap: 6px; align-items: center; }
+    .key {
+      display: inline-block;
+      background: #2a2a40;
+      border: 1px solid #4a4a6a;
+      border-radius: 3px;
+      padding: 1px 6px;
+      font-family: monospace;
+      font-size: 0.75rem;
+      color: #c0c0e0;
+    }
+
+    /* History log */
+    #historyList {
+      max-height: 180px;
+      overflow-y: auto;
+      font-size: 0.78rem;
+      color: #94a3b8;
+      display: flex;
+      flex-direction: column-reverse;  /* newest on top */
+    }
+    .hist-entry { padding: 2px 0; border-bottom: 1px solid #1a1a2e; }
+    .hist-entry.win-entry  { color: #4ade80; }
+    .hist-entry.over-entry { color: #f87171; }
+
+    /* Colour legend */
+    #colourLegend {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4px;
+    }
+    .colour-chip {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.72rem;
+      color: #94a3b8;
+    }
+    .chip-box {
+      width: 14px;
+      height: 14px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* Loading overlay */
+    #loader {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      color: #a0c4ff;
+      display: none;
+      z-index: 99;
+    }
+  </style>
+</head>
+<body>
+
+<h1>ARC-AGI-3 Visualizer</h1>
+
+<div id="topbar">
+  <select id="gameSelect"><option value="">Loading games…</option></select>
+  <button id="btnStart">▶ Start Game</button>
+  <button id="btnReset">↺ Reset</button>
+</div>
+
+<div id="status">Select a game and press Start.</div>
+
+<div id="main">
+  <!-- Canvas (64×64 grid scaled up) -->
+  <div id="canvasWrap">
+    <canvas id="grid" width="512" height="512"></canvas>
+    <div id="clickOverlay"></div>
+  </div>
+
+  <!-- Right panel -->
+  <div id="panel">
+
+    <!-- Stats -->
+    <div class="card">
+      <h3>Stats</h3>
+      <div class="stat-row"><span>Steps</span>   <span class="stat-val" id="statSteps">—</span></div>
+      <div class="stat-row"><span>Levels</span>  <span class="stat-val" id="statLevels">—</span></div>
+      <div class="stat-row"><span>State</span>   <span class="stat-val" id="statState">—</span></div>
+    </div>
+
+    <!-- Action buttons -->
+    <div class="card">
+      <h3>Actions <span style="font-weight:normal;color:#475569">(or press key)</span></h3>
+      <div id="actionGrid"></div>
+    </div>
+
+    <!-- Keyboard legend -->
+    <div class="card">
+      <h3>Keyboard shortcuts</h3>
+      <div id="keyLegend">
+        <div class="key-row"><span class="key">R</span> Reset level</div>
+        <div class="key-row"><span class="key">1</span>–<span class="key">7</span> ACTION1–7</div>
+        <div class="key-row"><span class="key">Click</span> on grid → ACTION6 (x,y)</div>
+      </div>
+    </div>
+
+    <!-- Action history -->
+    <div class="card">
+      <h3>Action History</h3>
+      <div id="historyList"></div>
+    </div>
+
+    <!-- Colour legend -->
+    <div class="card">
+      <h3>Colour key (values 0-15)</h3>
+      <div id="colourLegend"></div>
+    </div>
+
+  </div><!-- /panel -->
+</div><!-- /main -->
+
+<div id="loader">Loading…</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  COLOUR PALETTE  (ARC standard: 0=black … 14=dark-grey)
+// ═══════════════════════════════════════════════════════════
+const PALETTE = [
+  "#000000",  // 0  black
+  "#0074D9",  // 1  blue
+  "#FF4136",  // 2  red
+  "#2ECC40",  // 3  green
+  "#FFDC00",  // 4  yellow
+  "#AAAAAA",  // 5  grey
+  "#F012BE",  // 6  fuchsia/pink
+  "#FF851B",  // 7  orange
+  "#7FDBFF",  // 8  azure/light-blue
+  "#870C25",  // 9  maroon
+  "#FFFFFF",  // 10 white (unused but nice to have)
+  "#00FFFF",  // 11 cyan
+  "#FF69B4",  // 12 hot-pink
+  "#7B68EE",  // 13 medium-slate-blue
+  "#444444",  // 14 dark-grey
+  "#888800",  // 15 olive
+];
+const COLOUR_NAMES = [
+  "black","blue","red","green","yellow","grey",
+  "fuchsia","orange","azure","maroon","white",
+  "cyan","hot-pink","slate","dark-grey","olive",
+];
+
+// ═══════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════
+let currentGame   = null;   // short id, e.g. "ls20"
+let gameTags      = [];     // e.g. ["keyboard_click"]
+let gameRunning   = false;
+let lastGrid      = null;   // 64×64 array
+let availActions  = [];     // list of ints
+
+// ═══════════════════════════════════════════════════════════
+//  DOM refs
+// ═══════════════════════════════════════════════════════════
+const canvas       = document.getElementById("grid");
+const ctx          = canvas.getContext("2d");
+const overlay      = document.getElementById("clickOverlay");
+const gameSelect   = document.getElementById("gameSelect");
+const btnStart     = document.getElementById("btnStart");
+const btnReset     = document.getElementById("btnReset");
+const statusEl     = document.getElementById("status");
+const statSteps    = document.getElementById("statSteps");
+const statLevels   = document.getElementById("statLevels");
+const statState    = document.getElementById("statState");
+const actionGrid   = document.getElementById("actionGrid");
+const historyList  = document.getElementById("historyList");
+const colourLegend = document.getElementById("colourLegend");
+const loader       = document.getElementById("loader");
+
+// CELL_SIZE: how many pixels each game cell occupies on screen
+const CELL_SIZE = canvas.width / 64;   // 512/64 = 8px
+
+// ═══════════════════════════════════════════════════════════
+//  COLOUR LEGEND (static — built once)
+// ═══════════════════════════════════════════════════════════
+function buildColourLegend() {
+  colourLegend.innerHTML = "";
+  for (let i = 0; i < 16; i++) {
+    const chip = document.createElement("div");
+    chip.className = "colour-chip";
+    chip.innerHTML = `<div class="chip-box" style="background:${PALETTE[i]}"></div>${i}`;
+    chip.title = COLOUR_NAMES[i];
+    colourLegend.appendChild(chip);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  DRAW GRID
+// ═══════════════════════════════════════════════════════════
+function drawGrid(grid) {
+  if (!grid) return;
+  lastGrid = grid;
+  for (let r = 0; r < 64; r++) {
+    for (let c = 0; c < 64; c++) {
+      const val = grid[r][c];
+      ctx.fillStyle = PALETTE[val] || "#000";
+      ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+    }
+  }
+  // thin grid lines (optional — comment out if too busy)
+  ctx.strokeStyle = "rgba(255,255,255,0.04)";
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 64; i++) {
+    ctx.beginPath(); ctx.moveTo(i * CELL_SIZE, 0);            ctx.lineTo(i * CELL_SIZE, 512);  ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * CELL_SIZE);            ctx.lineTo(512, i * CELL_SIZE);  ctx.stroke();
+  }
+}
+
+// Draw a placeholder "no game" screen
+function drawPlaceholder() {
+  ctx.fillStyle = "#0f0f13";
+  ctx.fillRect(0, 0, 512, 512);
+  ctx.fillStyle = "#3a3a5c";
+  ctx.font = "16px Segoe UI";
+  ctx.textAlign = "center";
+  ctx.fillText("Select a game and press  ▶ Start", 256, 256);
+  ctx.textAlign = "left";
+}
+
+// ═══════════════════════════════════════════════════════════
+//  UPDATE UI FROM FRAME DATA
+// ═══════════════════════════════════════════════════════════
+function applyFrame(frame, actionLabel) {
+  drawGrid(frame.grid);
+  availActions = frame.available_actions || [];
+  statSteps.textContent  = frame.steps ?? "—";
+  statLevels.textContent = frame.levels_completed ?? "—";
+
+  const stateRaw = frame.state || "";
+  // Strip "GameState." prefix if present
+  const stateShort = stateRaw.replace("GameState.", "");
+  statState.textContent = stateShort;
+
+  updateActionButtons();
+  updateStatus(stateShort);
+
+  if (actionLabel) addHistory(actionLabel, stateShort);
+}
+
+function updateStatus(state) {
+  statusEl.className = "";
+  if (state === "WIN") {
+    statusEl.textContent = "🎉 You WIN! Press Reset to play again.";
+    statusEl.className = "win";
+  } else if (state === "GAME_OVER") {
+    statusEl.textContent = "💀 Game Over. Press Reset to retry.";
+    statusEl.className = "over";
+  } else if (state === "NOT_FINISHED") {
+    statusEl.textContent = "Game running — use buttons or keyboard to play.";
+  } else {
+    statusEl.textContent = state || "";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ACTION BUTTONS
+// ═══════════════════════════════════════════════════════════
+// Map action int → human label
+const ACTION_LABELS = {
+  0: "RESET",
+  1: "ACTION1",
+  2: "ACTION2",
+  3: "ACTION3",
+  4: "ACTION4",
+  5: "ACTION5",
+  6: "ACTION6 (click)",
+  7: "ACTION7",
+};
+// Keyboard key → action int
+const KEY_MAP = {
+  "r": 0,
+  "1": 1, "2": 2, "3": 3, "4": 4,
+  "5": 5, "6": 6, "7": 7,
+};
+
+function buildActionButtons() {
+  actionGrid.innerHTML = "";
+  for (let id = 0; id <= 7; id++) {
+    const btn = document.createElement("div");
+    btn.className = "action-btn";
+    btn.dataset.action = id;
+    btn.id = `abtn-${id}`;
+    btn.textContent = id === 0 ? "RESET" : (id === 6 ? "A6 click" : `A${id}`);
+    btn.title = ACTION_LABELS[id] + (id === 0 ? "" : ` (key: ${id})`);
+    btn.addEventListener("click", () => sendAction(id));
+    actionGrid.appendChild(btn);
+  }
+}
+
+function updateActionButtons() {
+  for (let id = 0; id <= 7; id++) {
+    const btn = document.getElementById(`abtn-${id}`);
+    if (!btn) continue;
+    const avail = availActions.includes(id);
+    btn.classList.toggle("disabled", !avail && id !== 0);
+  }
+}
+
+// Flash the button briefly when pressed
+function flashButton(actionId) {
+  const btn = document.getElementById(`abtn-${actionId}`);
+  if (!btn) return;
+  btn.classList.add("active");
+  setTimeout(() => btn.classList.remove("active"), 120);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  HISTORY LOG
+// ═══════════════════════════════════════════════════════════
+function addHistory(actionLabel, state) {
+  const el = document.createElement("div");
+  el.className = "hist-entry";
+  if (state === "WIN")       el.classList.add("win-entry");
+  if (state === "GAME_OVER") el.classList.add("over-entry");
+  el.textContent = `${actionLabel}  →  ${state}`;
+  historyList.appendChild(el);
+  // keep max 80 entries
+  while (historyList.children.length > 80) {
+    historyList.removeChild(historyList.lastChild);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  API CALLS
+// ═══════════════════════════════════════════════════════════
+async function fetchJSON(url, body) {
+  const res = await fetch(url, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(body),
+  });
+  return res.json();
+}
+
+async function sendAction(actionId, x, y) {
+  if (!gameRunning) return;
+  flashButton(actionId);
+
+  const body = { action: actionId };
+  if (actionId === 6 && x !== undefined) {
+    body.x = x;
+    body.y = y;
+  }
+
+  loader.style.display = "flex";
+  try {
+    const data = await fetchJSON("/api/step", body);
+    if (data.error) { setError(data.error); return; }
+    const label = actionId === 6
+      ? `A6 (${x ?? "?"},${y ?? "?"})`
+      : (ACTION_LABELS[actionId] || `A${actionId}`);
+    applyFrame(data, label);
+  } finally {
+    loader.style.display = "none";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  START / RESET
+// ═══════════════════════════════════════════════════════════
+btnStart.addEventListener("click", async () => {
+  const id = gameSelect.value;
+  if (!id) return;
+
+  currentGame  = id;
+  gameTags     = gameSelect.selectedOptions[0]?.dataset?.tags?.split(",") || [];
+  gameRunning  = false;
+  historyList.innerHTML = "";
+  statusEl.className = "";
+  statusEl.textContent = "Starting…";
+
+  loader.style.display = "flex";
+  try {
+    const data = await fetchJSON("/api/start", { game_id: id });
+    if (data.error) { setError(data.error); return; }
+    gameRunning = true;
+    applyFrame(data.frame, null);
+    statusEl.textContent = "Game running — use buttons or keyboard to play.";
+  } finally {
+    loader.style.display = "none";
+  }
+});
+
+btnReset.addEventListener("click", async () => {
+  if (!currentGame) return;
+  loader.style.display = "flex";
+  try {
+    const data = await fetchJSON("/api/reset", {});
+    if (data.error) { setError(data.error); return; }
+    gameRunning = true;
+    applyFrame(data.frame, "— RESET —");
+  } finally {
+    loader.style.display = "none";
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  KEYBOARD INPUT
+// ═══════════════════════════════════════════════════════════
+document.addEventListener("keydown", (e) => {
+  if (!gameRunning) return;
+  // Ignore if user is typing in a form element
+  if (["INPUT","TEXTAREA","SELECT"].includes(e.target.tagName)) return;
+
+  const key = e.key.toLowerCase();
+  if (KEY_MAP[key] !== undefined) {
+    e.preventDefault();
+    sendAction(KEY_MAP[key]);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  CLICK INPUT (for ACTION6 / click-type games)
+// ═══════════════════════════════════════════════════════════
+overlay.addEventListener("click", (e) => {
+  if (!gameRunning) return;
+  if (!availActions.includes(6)) return;  // only if ACTION6 is available
+
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = 64 / rect.width;
+  const scaleY = 64 / rect.height;
+  const gx = Math.floor((e.clientX - rect.left) * scaleX);
+  const gy = Math.floor((e.clientY - rect.top)  * scaleY);
+  sendAction(6, gx, gy);
+});
+
+// Show coordinates while hovering
+overlay.addEventListener("mousemove", (e) => {
+  if (!gameRunning) return;
+  const rect = canvas.getBoundingClientRect();
+  const gx = Math.floor((e.clientX - rect.left) * (64 / rect.width));
+  const gy = Math.floor((e.clientY - rect.top)  * (64 / rect.height));
+  overlay.title = `x=${gx}, y=${gy}`;
+});
+
+// ═══════════════════════════════════════════════════════════
+//  GAME LIST
+// ═══════════════════════════════════════════════════════════
+async function loadGameList() {
+  const res   = await fetch("/api/games");
+  const games = await res.json();
+
+  gameSelect.innerHTML = "";
+  if (!games.length) {
+    gameSelect.innerHTML = '<option value="">No games found</option>';
+    return;
+  }
+
+  games.forEach(g => {
+    const opt = document.createElement("option");
+    opt.value = g.id;
+    opt.textContent = `${g.title}  [${g.tags.join(", ") || "—"}]`;
+    opt.dataset.tags = g.tags.join(",");
+    gameSelect.appendChild(opt);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ERROR
+// ═══════════════════════════════════════════════════════════
+function setError(msg) {
+  statusEl.className = "over";
+  statusEl.textContent = "Error: " + msg;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════
+buildColourLegend();
+buildActionButtons();
+drawPlaceholder();
+loadGameList();
+</script>
+</body>
+</html>
