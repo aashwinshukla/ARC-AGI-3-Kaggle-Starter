@@ -152,7 +152,7 @@ class MyAgent(Agent):
         # Fallback: first available move
         for aid in (1, 2, 3, 4):
             if aid in avail:
-                return GameAction(aid)
+                return GameAction.from_id(aid)
         return GameAction.ACTION2
 
     def choose_action(
@@ -184,21 +184,21 @@ class MyAgent(Agent):
                 return GameAction.ACTION5
             moves = [a for a in (1, 2, 3, 4) if a in avail]
             if moves:
-                return GameAction(random.choice(moves))
+                return GameAction.from_id(random.choice(moves))
 
         # ── Find piece and target ─────────────────────────────────────────
         piece_color, target_color = self._find_piece_and_target(grid)
 
         if piece_color is None or target_color is None:
             moves = [a for a in (1, 2, 3, 4) if a in avail]
-            return GameAction(random.choice(moves)) if moves else GameAction.ACTION2
+            return GameAction.from_id(random.choice(moves)) if moves else GameAction.ACTION2
 
         piece_rc  = self._centroid(grid, piece_color)
         target_rc = self._centroid(grid, target_color)
 
         if piece_rc is None or target_rc is None:
             moves = [a for a in (1, 2, 3, 4) if a in avail]
-            return GameAction(random.choice(moves)) if moves else GameAction.ACTION2
+            return GameAction.from_id(random.choice(moves)) if moves else GameAction.ACTION2
 
         # ── Move piece toward target ──────────────────────────────────────
         return self._move_toward(piece_rc, target_rc, avail)
