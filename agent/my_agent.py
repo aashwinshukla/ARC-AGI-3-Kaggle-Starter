@@ -4,27 +4,27 @@ WHAT WE KNOW (from hands-on exploration of the 25 public games):
 
 GAME TYPES:
   1. Keyboard-slide (ar25, wa30, ls20, g50t, tr87, ...):
-       - One or more movable pieces navigated with A1/A2/A3/A4.
-       - Direction mapping varies per game — we learn it from the first moves.
+       - A1/A2/A3/A4 move a piece. Direction varies per game.
        - Win = move piece onto target zone.
+       - AR25 verified: A1=up, A2=down, A3=right, A4=left.
+       - WA30: piece=color14, A1=up(-4r). Target at row ~30.
+       - LS20: piece=color12, A1=up(-5r), A3=left(-5c), A4=right(+5c).
 
-  2. Click-only (vc33, tn36, r11l, s5i5, su15, lf52, lp85, ...):
-       - Only ACTION6 (click) is available or useful.
-       - Every click advances internal sprite state; win condition is internal.
-       - Strategy: repeatedly click every non-background cell systematically.
-       - VC33 confirmed: won level 1 in ~14-40 random clicks on non-bg cells.
+  2. Click-only (vc33, tn36, r11l, lp85, ...):
+       - Only ACTION6 (click) works.
+       - Win by cycling clicks across all non-bg cells.
+       - VC33 wins in ~14-40 random clicks on small-object region.
 
   3. Keyboard+click (most of the remaining 14 games):
-       - Both movement and clicking are needed.
-       - Fall back to hybrid: try movement toward target + click non-bg cells.
+       - Hybrid: move toward target + click fallback.
 
-GENERAL PRINCIPLES:
-  - Background = most frequent color.
-  - Target zone = cyan (11) if present, else smallest stationary cluster.
-  - Piece = color that moves most between frames.
-  - Stall detection: if grid doesn't change for 3+ steps, try next strategy.
-  - Learn direction mapping: probe A1-A4 and record which moves the piece.
-  - After GAME_OVER: RESET and retry (each retry adds more randomness).
+KEY IMPROVEMENTS IN THIS VERSION:
+  - Stall recovery now rotates through ALL 4 directions round-robin
+    instead of random (avoids re-picking the blocked direction).
+  - Stops wasting budget after level win (is_done returns True on WIN).
+  - Click cells rebuilt each cycle so they track moving objects.
+  - Piece-finding improved: after probe phase locks in moving color,
+    we track it across frames rather than re-detecting every step.
 """
 from __future__ import annotations
 
@@ -39,18 +39,15 @@ from agents.agent import Agent
 
 class MyAgent(Agent):
     """
-    Multi-strategy agent covering keyboard, click, and hybrid games.
+    Multi-strategy agent.
 
-    Phase 1 (first ~8 steps): probe each direction action to learn which
-      one moves the piece and in what direction.
-    Phase 2: navigate piece toward target using learned mapping.
-    Click games: cycle through all non-bg cells with ACTION6.
-    Stall recovery: try untried directions, then A5, then random.
+    For keyboard games: probes directions → navigates piece to target →
+      rotates through all 4 directions when stalled.
+    For click games: dense systematic cycling through all non-bg cells.
     """
 
     MAX_ACTIONS = 200
 
-    # The 4 direction actions
     DIR_ACTIONS = [GameAction.ACTION1, GameAction.ACTION2,
                    GameAction.ACTION3, GameAction.ACTION4]
 
@@ -59,26 +56,20 @@ class MyAgent(Agent):
         self._reset_episode()
 
     def _reset_episode(self) -> None:
-        """Reset all per-episode tracking."""
-        self._last_grid     = None   # previous frame grid
-        self._stall_count   = 0      # consecutive steps with no grid change
-        self._step          = 0      # total steps this episode
-        self._retry         = 0      # how many GAME_OVERs we've had
-
-        # Direction learning: maps GameAction → (delta_row, delta_col) for piece
+        self._last_grid       = None
+        self._stall_count     = 0
+        self._step            = 0
+        self._retry           = 0
         self._dir_map: dict[GameAction, tuple[float, float]] = {}
-        self._probe_queue   = list(self.DIR_ACTIONS)  # actions left to probe
-        self._probing       = True    # still in probe phase
-
-        # Click game state: list of (col, row) cells to click through
-        self._click_cells:  list[tuple[int,int]] = []
-        self._click_idx     = 0
-        self._is_click_game = False   # detected once on first frame
-
-        # Stall recovery: rotate through untried directions
-        self._last_dir      = None
-        self._dir_tries     = 0      # consecutive tries of same direction
-
+        self._probe_queue     = list(self.DIR_ACTIONS)
+        self._probing         = True
+        self._click_cells: list[tuple[int, int]] = []
+        self._click_idx       = 0
+        self._is_click_game   = False
+        # Stall recovery: rotate index through all 4 dirs instead of random
+        self._stall_dir_idx   = 0
+        # Lock on the confirmed piece color after probing
+        self._piece_color: int | None = None
         random.seed(hash(self.game_id) % 99991 + 7)
 
     @property
@@ -93,7 +84,6 @@ class MyAgent(Agent):
     @staticmethod
     def _to_grid(frame: FrameData) -> np.ndarray:
         raw = frame.frame
-        # frame.frame can be a list of layers or a single array
         layer = raw[0] if (isinstance(raw, (list, tuple)) and len(raw) > 0) else raw
         arr = np.array(layer, dtype=np.int16)
         arr[arr == -1] = 0
@@ -107,55 +97,49 @@ class MyAgent(Agent):
     @staticmethod
     def _centroid(grid: np.ndarray, color: int):
         mask = grid == color
-        if not mask.any(): return None
+        if not mask.any():
+            return None
         rs, cs = np.where(mask)
         return float(rs.mean()), float(cs.mean())
 
     def _moving_color(self, g0: np.ndarray, g1: np.ndarray, bg: int) -> int | None:
-        """Return the non-bg color whose centroid moved the most between frames."""
-        if g0.shape != g1.shape or g0.size == 0 or g1.size == 0:
+        """Color whose centroid moved the most between two frames."""
+        if g0.shape != g1.shape or g0.size == 0:
             return None
         diff_mask = g0 != g1
-        if not diff_mask.any(): return None
-        changed_colors = set(int(v) for v in np.unique(g0[diff_mask])) | \
-                         set(int(v) for v in np.unique(g1[diff_mask]))
-        changed_colors -= {bg, 0}
+        if not diff_mask.any():
+            return None
+        changed = (set(int(v) for v in np.unique(g0[diff_mask])) |
+                   set(int(v) for v in np.unique(g1[diff_mask]))) - {bg, 0}
         best_color, best_dist = None, 0.0
-        for color in changed_colors:
+        for color in changed:
             c0 = self._centroid(g0, color)
             c1 = self._centroid(g1, color)
             if c0 and c1:
-                dist = abs(c0[0]-c1[0]) + abs(c0[1]-c1[1])
-                if dist > best_dist:
-                    best_dist = dist
-                    best_color = color
+                d = abs(c0[0] - c1[0]) + abs(c0[1] - c1[1])
+                if d > best_dist:
+                    best_dist, best_color = d, color
         return best_color
 
-    def _build_click_cells(self, grid: np.ndarray, bg: int) -> list[tuple[int,int]]:
+    def _build_click_cells(self, grid: np.ndarray, bg: int) -> list[tuple[int, int]]:
         """
-        Build ordered list of (col, row) cells to click.
-        Prioritises small clusters (likely interactive sprites).
-        Densely samples every non-bg cell so cycling through them
-        covers the whole interactive area.
+        All non-bg cells, small clusters first, up to 16 samples each.
+        Shuffled so repeated cycles explore different orders.
         """
         vals, counts = np.unique(grid, return_counts=True)
-        # Sort colors: small clusters first (more likely to be targets/buttons)
-        color_order = [int(v) for v,c in sorted(zip(vals,counts), key=lambda x:x[1])
+        color_order = [int(v) for v, c in sorted(zip(vals, counts), key=lambda x: x[1])
                        if int(v) not in (bg, 0)]
-        cells = []
-        seen = set()
+        cells: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
         for color in color_order:
-            mask = (grid == color)
+            mask = grid == color
             rs, cs = np.where(mask)
-            # Take up to 16 evenly-spaced cells per color
             n = min(16, len(rs))
-            idxs = np.linspace(0, len(rs)-1, n, dtype=int)
-            for i in idxs:
+            for i in np.linspace(0, len(rs) - 1, n, dtype=int):
                 key = (int(cs[i]), int(rs[i]))
                 if key not in seen:
                     cells.append(key)
                     seen.add(key)
-        # Shuffle slightly so repeated cycles explore different orderings
         random.shuffle(cells)
         return cells
 
@@ -163,9 +147,9 @@ class MyAgent(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
 
-        # ── RESET on game-over / not started ─────────────────────────────
+        # ── Reset on game-over ────────────────────────────────────────────
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            self._retry += 1
+            self._retry      += 1
             self._last_grid   = None
             self._stall_count = 0
             self._step        = 0
@@ -174,6 +158,8 @@ class MyAgent(Agent):
             self._dir_map     = {}
             self._click_cells = []
             self._click_idx   = 0
+            self._piece_color = None
+            self._stall_dir_idx = 0
             return GameAction.RESET
 
         self._step += 1
@@ -181,22 +167,18 @@ class MyAgent(Agent):
         avail = list(latest_frame.available_actions or [])
         bg    = self._dominant(grid)
 
-        # ── Detect click-only game on first real step ─────────────────────
+        # ── First step: detect game type and seed defaults ────────────────
         if self._step == 1:
-            # Click-only game: ONLY action 6 available (or no 1-4)
-            dir_avail_check = [a for a in (1,2,3,4) if a in avail]
-            self._is_click_game = (len(dir_avail_check) == 0)
-            # Build click cell list regardless (used as fallback too)
-            self._click_cells = self._build_click_cells(grid, bg)
-            self._click_idx   = 0
-            # Pre-seed the AR25-verified direction mapping as default assumption.
-            # A1=up(-row), A2=down(+row), A3=right(+col), A4=left(-col).
-            # Probe phase will correct this if wrong.
+            dir_present = [a for a in (1, 2, 3, 4) if a in avail]
+            self._is_click_game = (len(dir_present) == 0)
+            self._click_cells   = self._build_click_cells(grid, bg)
+            self._click_idx     = 0
+            # Default direction map (AR25-verified; probe phase refines it)
             self._dir_map = {
-                GameAction.ACTION1: (-3.0,  0.0),
-                GameAction.ACTION2: ( 3.0,  0.0),
-                GameAction.ACTION3: ( 0.0,  3.0),
-                GameAction.ACTION4: ( 0.0, -3.0),
+                GameAction.ACTION1: (-3.0,  0.0),   # up
+                GameAction.ACTION2: ( 3.0,  0.0),   # down
+                GameAction.ACTION3: ( 0.0,  3.0),   # right
+                GameAction.ACTION4: ( 0.0, -3.0),   # left
             }
 
         # ── Stall detection ───────────────────────────────────────────────
@@ -204,139 +186,121 @@ class MyAgent(Agent):
         if self._last_grid is not None:
             changed = bool((grid != self._last_grid).any())
         self._stall_count = 0 if changed else self._stall_count + 1
-        self._last_grid = grid.copy()
+        self._last_grid   = grid.copy()
 
-        # ── CLICK-ONLY GAME STRATEGY ──────────────────────────────────────
-        if self._is_click_game or (6 in avail and not any(a in avail for a in (1,2,3,4))):
-            # Rebuild click list every 2 cycles (grid changes)
-            if self._click_idx >= len(self._click_cells) or self._step == 1:
+        # ── Click-only games ──────────────────────────────────────────────
+        if self._is_click_game or (6 in avail and not any(a in avail for a in (1, 2, 3, 4))):
+            # Rebuild list each cycle so we track any grid changes
+            if self._click_idx >= len(self._click_cells):
                 self._click_cells = self._build_click_cells(grid, bg)
                 self._click_idx   = 0
-
             if self._click_cells:
                 col, row = self._click_cells[self._click_idx % len(self._click_cells)]
                 self._click_idx += 1
-                act = GameAction.ACTION6
-                act.set_data({"x": col, "y": row})
-                return act
+                GameAction.ACTION6.set_data({"x": col, "y": row})
+                return GameAction.ACTION6
 
-        # ── KEYBOARD / HYBRID GAME STRATEGY ──────────────────────────────
-
+        # ── Keyboard / hybrid games ───────────────────────────────────────
         dir_avail = [a for a in self.DIR_ACTIONS if a.value in avail]
 
-        # ── Phase 1: probe directions to learn mapping ────────────────────
-        if self._probing and self._probe_queue and self._last_grid is not None:
-            # We just executed an action — record what moved
-            if len(frames) >= 2:
+        # Probe phase: fire each direction once, record how piece responds
+        if self._probing and self._probe_queue:
+            if len(frames) >= 2 and self._last_grid is not None:
                 try:
-                    prev_frame = frames[-2]
-                    prev_grid  = self._to_grid(prev_frame)
-                    if prev_grid.shape == (64,64) and prev_grid.size > 0:
+                    prev_grid = self._to_grid(frames[-2])
+                    if prev_grid.shape == (64, 64):
                         mc = self._moving_color(prev_grid, grid, bg)
-                        if mc and len(self._probe_queue) < len(self.DIR_ACTIONS):
+                        if mc:
+                            # Which direction did we just probe?
                             tried_idx = len(self.DIR_ACTIONS) - len(self._probe_queue) - 1
                             if 0 <= tried_idx < len(self.DIR_ACTIONS):
                                 tried_act = self.DIR_ACTIONS[tried_idx]
-                                c_prev = self._centroid(prev_grid, mc)
-                                c_curr = self._centroid(grid, mc)
-                                if c_prev and c_curr:
-                                    dr = c_curr[0] - c_prev[0]
-                                    dc = c_curr[1] - c_prev[1]
+                                cp = self._centroid(prev_grid, mc)
+                                cc = self._centroid(grid, mc)
+                                if cp and cc:
+                                    dr = cc[0] - cp[0]
+                                    dc = cc[1] - cp[1]
                                     if abs(dr) > 0.5 or abs(dc) > 0.5:
                                         self._dir_map[tried_act] = (dr, dc)
+                                        self._piece_color = mc  # lock in piece
                 except Exception:
                     pass
 
-            # Fire next probe action
-            if self._probe_queue:
-                next_probe = self._probe_queue.pop(0)
-                if next_probe in dir_avail:
-                    return next_probe
-            else:
+            next_probe = self._probe_queue.pop(0)
+            if not self._probe_queue:
                 self._probing = False
+            if next_probe in dir_avail:
+                return next_probe
 
         if not self._probe_queue:
             self._probing = False
 
-        # ── Find piece and target ─────────────────────────────────────────
-        # Piece = smallest moving color (prefer what dir_map found)
-        piece_color = None
-        if self._dir_map:
-            # Use a color that was observed moving
-            for act, (dr,dc) in self._dir_map.items():
-                if abs(dr)+abs(dc) > 0.5:
-                    # Find color that moved with this action
-                    if len(frames) >= 2:
-                        mc = self._moving_color(
-                            self._to_grid(frames[-2]) if len(frames) >= 2 else grid,
-                            grid, bg)
-                        if mc:
-                            piece_color = mc
-                            break
-
-        if piece_color is None:
-            # Fallback: prefer small non-bg clusters not equal to 9,10,11 (those tend to be targets/UI)
+        # ── Identify piece color ──────────────────────────────────────────
+        piece_color = self._piece_color
+        if piece_color is None or not (grid == piece_color).any():
+            # Re-detect: smallest non-bg cluster (excluding common UI colors)
             vals, counts = np.unique(grid, return_counts=True)
-            candidates = [(int(v),int(c)) for v,c in zip(vals,counts)
-                          if int(v) not in (bg,0,9,10,11) and int(c) < 200]
+            candidates = [(int(v), int(c)) for v, c in zip(vals, counts)
+                          if int(v) not in (bg, 0, 9, 10, 11) and int(c) < 300]
             if candidates:
-                piece_color = min(candidates, key=lambda x:x[1])[0]
+                piece_color = min(candidates, key=lambda x: x[1])[0]
 
-        # Target = cyan(11), else color9 (maroon), else smallest stationary cluster
+        # ── Identify target color ─────────────────────────────────────────
+        unique_colors = set(int(v) for v in np.unique(grid)) - {bg, 0}
         target_color = None
-        if 11 in np.unique(grid) and 11 != bg:
-            target_color = 11
-        elif 9 in np.unique(grid) and 9 != bg:
-            target_color = 9
-        else:
+        # Prefer cyan (11), then maroon (9), then smallest remaining cluster
+        for preferred in (11, 9):
+            if preferred in unique_colors and preferred != piece_color:
+                target_color = preferred
+                break
+        if target_color is None:
             vals, counts = np.unique(grid, return_counts=True)
-            # Pick smallest non-bg, non-piece cluster
-            candidates = [(int(v),int(c)) for v,c in zip(vals,counts)
-                          if int(v) not in (bg, 0, piece_color or -1)]
+            candidates = [(int(v), int(c)) for v, c in zip(vals, counts)
+                          if int(v) not in (bg, 0) and int(v) != piece_color]
             if candidates:
-                target_color = min(candidates, key=lambda x:x[1])[0]
+                target_color = min(candidates, key=lambda x: x[1])[0]
 
-        # ── Stall recovery ────────────────────────────────────────────────
+        # ── Stall recovery: rotate through all directions round-robin ─────
+        # This avoids re-picking the wall that's already blocking us.
         if self._stall_count >= 3:
-            self._stall_count = 0
-            # Try A5 (piece cycle / special action)
-            if GameAction.ACTION5.value in avail:
+            self._stall_count    = 0
+            self._stall_dir_idx += 1
+            # Try A5 every other stall (cycles piece in multi-piece games)
+            if self._stall_dir_idx % 2 == 0 and GameAction.ACTION5.value in avail:
                 return GameAction.ACTION5
-            # Try each direction we haven't tried recently
+            # Otherwise try the next direction in rotation
             if dir_avail:
-                return random.choice(dir_avail)
-            # Try click on a non-bg cell
+                idx = self._stall_dir_idx % len(dir_avail)
+                return dir_avail[idx]
+            # Click fallback
             if 6 in avail and self._click_cells:
                 col, row = self._click_cells[self._click_idx % len(self._click_cells)]
                 self._click_idx += 1
-                act = GameAction.ACTION6
-                act.set_data({"x": col, "y": row})
-                return act
+                GameAction.ACTION6.set_data({"x": col, "y": row})
+                return GameAction.ACTION6
 
-        # ── Move piece toward target using learned or inferred mapping ────
+        # ── Navigate piece toward target ──────────────────────────────────
         if piece_color and target_color:
             pc = self._centroid(grid, piece_color)
             tc = self._centroid(grid, target_color)
 
             if pc and tc:
-                dr_needed = tc[0] - pc[0]  # positive = need to go down
-                dc_needed = tc[1] - pc[1]  # positive = need to go right
+                dr_needed = tc[0] - pc[0]   # +ve = need to go down
+                dc_needed = tc[1] - pc[1]   # +ve = need to go right
 
-                if self._dir_map:
-                    # Use learned mapping: find action whose direction best aligns
-                    best_act, best_score = None, -999.0
-                    for act, (dr, dc) in self._dir_map.items():
-                        if act not in dir_avail: continue
-                        # Dot product: higher = more aligned with needed direction
-                        score = dr * dr_needed + dc * dc_needed
-                        if score > best_score:
-                            best_score = score
-                            best_act = act
-                    if best_act and best_score > 0:
-                        return best_act
+                # Use learned mapping: pick action most aligned with needed direction
+                best_act, best_score = None, -999.0
+                for act, (dr, dc) in self._dir_map.items():
+                    if act not in dir_avail:
+                        continue
+                    score = dr * dr_needed + dc * dc_needed
+                    if score > best_score:
+                        best_score = score
+                        best_act   = act
+                if best_act and best_score > 0:
+                    return best_act
 
-                # No learned mapping or no good match — use AR25-verified fallback
-                # (A1=up, A2=down, A3=right, A4=left confirmed for AR25)
+                # Fallback if no learned mapping aligned: simple axis priority
                 if abs(dr_needed) >= abs(dc_needed):
                     act = GameAction.ACTION1 if dr_needed < 0 else GameAction.ACTION2
                 else:
@@ -344,24 +308,18 @@ class MyAgent(Agent):
                 if act in dir_avail:
                     return act
 
-        # ── A5 if available (piece cycle in multi-piece games) ────────────
-        if GameAction.ACTION5.value in avail and self._step % 8 == 0:
+        # ── A5 periodically (multi-piece games) ──────────────────────────
+        if GameAction.ACTION5.value in avail and self._step % 10 == 0:
             return GameAction.ACTION5
 
-        # ── Hybrid: also try clicking non-bg cells ────────────────────────
-        if 6 in avail and self._step % 5 == 0 and self._click_cells:
+        # ── Hybrid click occasionally ─────────────────────────────────────
+        if 6 in avail and self._step % 7 == 0 and self._click_cells:
             col, row = self._click_cells[self._click_idx % len(self._click_cells)]
             self._click_idx += 1
-            act = GameAction.ACTION6
-            act.set_data({"x": col, "y": row})
-            return act
+            GameAction.ACTION6.set_data({"x": col, "y": row})
+            return GameAction.ACTION6
 
-        # ── Last resort: random available direction ───────────────────────
+        # ── Last resort ───────────────────────────────────────────────────
         if dir_avail:
-            # Add some retry-based noise
-            if self._retry > 1:
-                return random.choice(dir_avail)
             return dir_avail[self._step % len(dir_avail)]
-
-        # Absolute fallback
         return GameAction.ACTION1
